@@ -1,0 +1,31 @@
+# Copyright 2015, Yahoo Inc.
+# Licensed under the terms of the Apache License 2.0. Please see LICENSE file in the project root for terms.
+
+kafka.brokers:
+  - "jkmaster"
+kafka.port: 9092
+kafka.sourcetopic: "source-topic"
+kafka.acktopic: "ack-topic"
+kafka.queuetopic: "queue-topic"
+kafka.partitions: 3
+kafka.zookeeper.path: /
+key.serializer: org.apache.kafka.common.serialization.StringSerializer
+key.deserializer: org.apache.kafka.common.serialization.StringDeserializer
+value.serializer: org.apache.kafka.common.serialization.StringSerializer
+value.deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+akka.zookeeper.path: /akkaQuery
+
+zookeeper.servers:
+  - "jkmaster"
+zookeeper.port: 2181
+
+process.hosts: 10
+process.cores: 12
+
+#Flink specific
+group.id: "flink_yahoo_benchmark"
+flink.checkpoint.interval: 6000
+add.result.sink: 1
+flink.highcard.checkpointURI: "file:///tmp/checkpoints"
+redis.threads: 20

@@ -1,0 +1,4 @@
+#!/bin/bash
+
+java -jar target/util-tool-1.0-SNAPSHOT.jar ~/Downloads/splittweetstream.txt true 1 $1
+

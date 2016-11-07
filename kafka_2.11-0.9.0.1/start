@@ -1,0 +1,52 @@
+#!/bin/zsh
+pid_match() {
+  local VAL=`ps -aef | grep "$1" | grep -v grep | awk '{print $2}'`
+  echo "$VAL"
+}
+
+start_if_needed() {
+  local match="$1"
+  shift
+  local name="$1"
+  shift
+  local sleep_time="$1"
+  shift
+  local PID=`pid_match "$match"`
+
+  if [[ "$PID" -ne "" ]];
+  then
+    echo "$name is already running..."
+  else
+    "$@" &
+    sleep $sleep_time
+  fi
+}
+
+stop_if_needed() {
+  local match="$1"
+  local name="$2"
+  local PID=`pid_match "$match"`
+  if [[ "$PID" -ne "" ]];
+  then
+    kill "$PID"
+    sleep 1
+    local CHECK_AGAIN=`pid_match "$match"`
+    if [[ "$CHECK_AGAIN" -ne "" ]];
+    then
+      kill -9 "$CHECK_AGAIN"
+    fi
+  else
+    echo "No $name instance found to stop"
+  fi
+}
+
+start_if_needed zookeeper ZooKeeper 5 "bin/zookeeper-server-start.sh"  "config/zookeeper.properties"
+sleep 3
+start_if_needed kafka\.Kafka Kafka 5 "bin/kafka-server-start.sh" "config/server.properties"
+sleep 3
+bin/kafka-topics.sh --create --topic source-topic --zookeeper jkmaster:2181 --partitions 1 --replication-factor 1
+sleep 3
+bin/kafka-topics.sh --create --topic ack-topic --zookeeper jkmaster:2181 --partitions 1 --replication-factor 1
+sleep 3
+bin/kafka-topics.sh --create --topic queue-topic --zookeeper jkmaster:2181 --partitions 1 --replication-factor 1
+
