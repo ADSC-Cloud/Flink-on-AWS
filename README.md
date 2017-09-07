@@ -9,3 +9,6 @@ The topology is implemented in `flink-example` project. Under `script` folder, t
 
 `analysis.html` shows the result generated from `LOGS`. Because the log files are so large, we only provide one example `LOGS/20161212/5000-600/600.log` in this git repo.
 
+
+## Acknowledgement
+This work was partially supported by SingAREN/AWS Cloud Credit for Research Program 2016.
