@@ -1,0 +1,13 @@
+#!/bin/bash
+
+OPT="-i ~/.ssh/flink-cluster.pem -o StrictHostKeyChecking=no"
+M1="54.229.112.187"
+M2="54.194.119.212"
+M3="54.194.61.210"
+
+./download_logs
+
+ssh $OPT ubuntu@$M1 'for i in 1 2 3 4; do ssh slave$i sudo shutdown now; done; sudo shutdown now'
+ssh $OPT ubuntu@$M2 'for i in 1 2 3 4; do ssh slave$i sudo shutdown now; done; sudo shutdown now'
+ssh $OPT ubuntu@$M3 'for i in 1 2 3 4; do ssh slave$i sudo shutdown now; done; sudo shutdown now'
+

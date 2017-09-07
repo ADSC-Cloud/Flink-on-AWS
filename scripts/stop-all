@@ -1,0 +1,26 @@
+#!/bin/bash
+
+. ./config
+
+kill_jpp CliFrontend
+kill_jpp util-tool
+
+#rm ~/MessageController.log
+
+if $NEED_KAFKA; then
+	cd $AWS_KAFKA_DIR
+	./stop
+fi
+
+if $NEED_FLINK; then
+	cd $AWS_FLINK_DIR
+	./cancel
+	./clear-logs
+	bin/stop-cluster.sh
+fi
+
+if $NEED_HADOOP; then
+	cd $AWS_HADOOP_DIR
+	./stop
+fi
+

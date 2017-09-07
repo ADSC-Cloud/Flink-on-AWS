@@ -1,0 +1,13 @@
+#!/bin/bash
+
+. ./config
+
+sed '/.*slave.*\|.*jkmaster.*/d' /etc/hosts > tmpf
+sudo bash -c "mv tmpf /etc/hosts"
+
+for slave in $(cat slaves); do
+	ssh $SSHOPT $slave "sed '/.*slave.*\|.*jkmaster.*/d' /etc/hosts > tmpf; sudo bash -c \"mv tmpf /etc/hosts\"; rm -rf tmpf flink-1.1.3"
+done
+
+./init
+

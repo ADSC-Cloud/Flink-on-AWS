@@ -1,0 +1,45 @@
+#!/bin/bash
+
+if [[ "$#" -ne 3 || ( "$#" -eq 1 && ( "$1" = "-h" || "$1" = "--help" )) ]]; then
+	echo "Run Benchmark once"
+	echo "Usage: ./run <rate> <isCkp> <ckpInterval>"
+	exit 1
+fi
+
+. ./config
+
+rate=${1:-600}
+isCkp=${2:-false}
+ckpInterval=${3:-5000}
+isS3=false
+
+cd $AWS_FLINK_DIR
+./clear-logs
+# start flink
+bin/start-cluster.sh
+# bin/yarn-session.sh -n 5 -jm 1024 -tm 4096 &
+
+# run APP
+bin/flink run $AWS_APP_PATH --rate $rate --isCkp $isCkp --ckpInterval $ckpInterval --isS3 $isS3 --dataPath $STREAM_SOURCE&
+sleep $MEASURE_TIME
+./cancel
+kill_jpp CliFrontend
+
+# collect logs
+cd $BASE_DIR
+for slave in $(cat $AWS_FLINK_DIR/conf/slaves); do
+	scp $slave:$AWS_FLINK_DIR/log/flink-*-taskmanager-*.log $rate.log
+	# if the log contains latency info
+	# like: #*FROMSOURCE #*FROMFINAL #*LATENCY
+	if grep -q "#\*" $rate.log; then
+		break
+	fi
+done
+
+# stop flink
+cd $AWS_FLINK_DIR
+bin/stop-cluster.sh
+# for appid in `yarn application -list | grep application_ | cut -d ' ' -f 1 | awk '{print $1}'`; do
+	# yarn application -kill $appid
+# done
+

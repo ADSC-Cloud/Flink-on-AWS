@@ -1,0 +1,22 @@
+#!/bin/zsh
+
+. ~/.zshrc
+
+LB=${1-:600}
+shift
+UB=${1-:600}
+shift
+
+while [[ $# -gt 0 ]]; do
+	for ((i=$LB; i<=$UB; i+=200)) do
+		rscpi ~/DODO/$1-$i .
+		#rscpi ~/DODO/10000-$i .
+		#rscpi ~/DODO/15000-$i .
+	done
+	shift
+done
+#ssh -i ~/.ssh/flink-cluster.pem -o StrictHostKeyChecking=no ubuntu@$AWS_MASTER "cd DODO/hadoop-2.7.2; ./stop; exit"
+#ssh -i ~/.ssh/flink-cluster.pem -o StrictHostKeyChecking=no ubuntu@$AWS_MASTER2 "cd DODO/hadoop-2.7.2; ./stop; exit"
+#ssh -i ~/.ssh/flink-cluster.pem -o StrictHostKeyChecking=no ubuntu@$AWS_MASTER3 "cd DODO/hadoop-2.7.2; ./stop; exit"
+#sleep 30
+

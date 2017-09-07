@@ -1,0 +1,54 @@
+#!/bin/zsh
+
+function kill_jpp() {
+	jps | grep $1 | cut -d ' ' -f 1 | xargs kill -9 
+	sleep 2
+}
+
+. ./config
+
+cd $AWS_HADOOP_DIR
+./clear
+./start
+
+rm ~/MessageController.log
+cd $AWS_FLINK_DIR
+bin/start-cluster.sh
+
+for ((rate=600; rate<=2000; rate+=200)) do
+	cd $BASE_DIR
+	mkdir -p $rate
+	for ((j=$rate; j<=((rate+2)); j++)) do
+		cd $AWS_KAFKA_DIR
+		./start
+
+		cd $AWS_FLINK_DIR
+		bin/flink run $AWS_APP_PATH --isCkp true --ckpInterval 5000 --timeWinSize 100&
+		sleep 10
+
+		java -jar $AWS_UTILTOOL_PATH $STREAM_SOURCE false $rate&
+		sleep $MEASURE_TIME
+
+		kill_jpp util-tool
+
+		cd $AWS_FLINK_DIR
+		./cancel
+
+		mv ~/MessageController.log $rate/$j.log
+
+		cd $AWS_KAFKA_DIR
+		./stop
+		
+		kill_jpp CliFrontend
+
+		sleep 10
+	done
+	sleep 60
+done
+
+cd $AWS_FLINK_DIR
+bin/stop-cluster.sh
+
+cd $AWS_HADOOP_DIR
+./stop
+

@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# read configuration
+. ./config
+
+# install-java8 command (not necessary in EMR as java8 is pre-installed)
+INSTALL_JAVA8_CMD="echo oracle-java8-installer shared/accepted-oracle-license-v1-1 select true | sudo /usr/bin/debconf-set-selections; sudo add-apt-repository ppa:webupd8team/java -y; sudo apt-get update; sudo apt-get -y install oracle-java8-installer"
+
+### Modify /etc/hosts ###
+
+# get master ip
+echo "$(ifconfig | grep Bcast | cut -d : -f 2 | cut -d B -f 1) jkmaster" > temphosts
+
+# get slave ip
+
+# used in EMR (with hadoop pre-installed)
+# hdfs dfsadmin -report | grep Name: | cut -d : -f 2 | sed 's/ //g' > slaves
+
+# used in EC2
+# 'slaves' file sample (two slaves):
+# -------------------
+# 172.16.0.1
+# 172.16.0.2
+# -------------------
+if [[ ! -e slaves ]]; then
+	echo "ERROR: file 'slaves' does not exist"
+	exit 1
+fi
+
+slave_cnt=1
+for slave in $(cat slaves); do
+	echo "$slave slave$slave_cnt" >> temphosts
+	slave_cnt=$((slave_cnt+1))
+done
+
+# update /etc/hosts
+sudo bash -c "cat temphosts >> /etc/hosts"
+
+# generate ssh key
+if [[ ! -e ~/.ssh/id_rsa ]]; then
+	ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa
+fi
+# set ssh permission without password
+cat ~/.ssh/id_rsa.pub >>  ~/.ssh/authorized_keys
+
+# install java8
+bash -c "$INSTALL_JAVA8_CMD"
+
+# download splittweetstream.txt
+$AWS_METRIC_DIR/S3Util --download flink-cluster splittweetstream.txt splittweetstream.txt
+
+for slave in $(cat slaves); do
+	# update /etc/hosts
+	scp $SSHOPT temphosts $slave:~
+	ssh $SSHOPT $slave "sudo bash -c \"cat temphosts >> /etc/hosts\"; mkdir -p ~/$PACK_NAME; rm ~/temphosts"
+	# install java8
+	ssh $SSHOPT $slave $INSTALL_JAVA8_CMD
+	# copy PACKAGE
+	scp $SSHOPT ~/$PACK_NAME.tar.gz $slave:~
+	ssh $SSHOPT $slave "tar zxf $PACK_NAME.tar.gz"
+	if [[ ! -e ~/$PACK_NAME/splittweetstream.txt ]]; then
+		echo "splittweetstream.txt does not exist!"
+		exit 1
+	fi
+	scp $SSHOPT ~/$PACK_NAME/splittweetstream.txt $slave:~/$PACK_NAME/splittweetstream.txt
+	# set ssh permission without password
+	cat ~/.ssh/id_rsa.pub | ssh $SSHOPT $slave "mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
+	# copy keys
+	if [[ ! -e ~/.ssh/flink-cluster.pem ]]; then
+		echo "~/.ssh/flink-cluster.pem does not exist!"
+		exit 1
+	fi
+	scp $SSHOPT ~/.ssh/flink-cluster.pem $slave:~/.ssh
+	if [[ ! -d ~/.aws ]]; then
+		echo "~/.aws does not exist!"
+		exit 1
+	fi
+	scp $SSHOPT -r ~/.aws $slave:~/.aws
+done
+
+# try ssh-keyscan to avoid typing "yes/no" next time for message below
+# """
+# The authenticity of host xxxx can't be established.
+# ECDSA key fingerprint is blablabla.
+# Are you sure you want to continue connecting (yes/no)?
+# """
+ssh -o StrictHostKeyChecking=no 0.0.0.0 "exit"
+ssh -o StrictHostKeyChecking=no jkmaster "exit"
+for ((i=1; i<$slave_cnt; i++)) do
+	ssh-keyscan slave$i
+done
+
+rm temphosts
+#rm slaves
+

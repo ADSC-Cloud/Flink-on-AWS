@@ -1,0 +1,28 @@
+#!/bin/zsh
+
+WAITINGTIME=150
+
+if [[ $2 == "--S3" ]]; then
+	ISS3=true
+	MSGFILE=s3
+else
+	ISS3=false
+	MSGFILE=/home/jkadbear/Downloads/splittweetstream.txt
+fi
+
+BASEDIR=`pwd`
+RATE=${1:-600}
+KAFKADIR=$BASEDIR/kafka_2.11-0.9.0.1
+FLINKDIR=$BASEDIR/flink-1.1.3
+APPDIR=$BASEDIR/flink-example
+MSGCTRLDIR=$BASEDIR/util-tool
+
+cd $KAFKADIR
+./start
+sleep 20
+cd $FLINKDIR
+bin/flink run $APPDIR/target/flink-example-0.1.jar &
+sleep 20
+cd $MSGCTRLDIR
+java -jar target/util-tool-1.0-SNAPSHOT.jar $MSGFILE $ISS3 $WAITINGTIME $RATE &
+

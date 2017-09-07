@@ -1,0 +1,31 @@
+#!/bin/bash
+
+if [[ "$#" -ge 1 && ( "$1" = "-h" || "$1" = "--help" ) ]]; then
+	echo "Run Multiple Benchmark"
+	echo "Usage: ./multi_run [RATE_START] [RATE_END] [RATE_INTV]"
+	echo "default: RATE_START=600 RATE_END=2000 RATE_INTV=200"
+	exit 1
+fi
+
+# read configuration
+. ./config
+
+RATE_START=${1:-600}
+RATE_END=${2:-2000}
+RATE_INTV=${3:-200}
+isCkp=true
+
+for ckpInv in ${CKP_INTV_LIST[@]}; do
+	for ((i=$RATE_START; i<=$RATE_END; i+=$RATE_INTV)) do
+		logdir=$ckpInv-$i
+		mkdir -p $logdir 
+		for ((j=$i; j<$((i+$TIMES_PER_TEST)); j++)) do
+			./run $i $isCkp $ckpInv
+			mv $i.log $logdir/$j.log
+			sleep 10
+		done
+		sleep 30
+	done
+	sleep 30
+done
+

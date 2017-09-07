@@ -1,0 +1,46 @@
+#!/bin/bash
+
+NEED_HADOOP=true
+NEED_KAFKA=false
+NEED_FLINK=true
+
+BASE_DIR=`pwd`
+
+# LO_: Local Old position
+# LN_: Local New position (in Package)
+# AWS_: AWS position
+PACK_NAME="DODO"
+SSHOPT=(-i ~/.ssh/flink-cluster.pem -o StrictHostKeyChecking=no)
+LO_METRIC_DIR="$BASE_DIR/Metric"
+LN_METRIC_DIR="$BASE_DIR/$PACK_NAME/Metric"
+AWS_METRIC_DIR="$BASE_DIR/Metric"
+LO_UTILTOOL_DIR="$BASE_DIR/util-tool"
+LN_UTILTOOL_DIR="$BASE_DIR/$PACK_NAME/util-tool"
+AWS_UTILTOOL_DIR="$BASE_DIR/util-tool"
+UTILTOOL_NAME="util-tool-1.0.jar"
+AWS_UTILTOOL_PATH="$AWS_UTILTOOL_DIR/$UTILTOOL_NAME"
+LO_FLINK_DIR="$BASE_DIR/flink-1.1.3"
+LN_FLINK_DIR="$BASE_DIR/$PACK_NAME/flink-1.1.3"
+AWS_FLINK_DIR="$BASE_DIR/flink-1.1.3"
+LO_HADOOP_DIR="$BASE_DIR/hadoop-2.7.2"
+LN_HADOOP_DIR="$BASE_DIR/$PACK_NAME/hadoop-2.7.2"
+AWS_HADOOP_DIR="$BASE_DIR/hadoop-2.7.2"
+LO_KAFKA_DIR="$BASE_DIR/kafka_2.11-0.9.0.1"
+LN_KAFKA_DIR="$BASE_DIR/$PACK_NAME/kafka_2.11-0.9.0.1"
+AWS_KAFKA_DIR="$BASE_DIR/kafka_2.11-0.9.0.1"
+APP_NAME="flink-example-1.0.jar"
+LO_APP_PATH="$BASE_DIR/flink-example/target/$APP_NAME"
+LN_APP_PATH="$BASE_DIR/$PACK_NAME/$APP_NAME"
+AWS_APP_PATH="$BASE_DIR/$APP_NAME"
+
+STREAM_SOURCE="$BASE_DIR/splittweetstream.txt"
+
+MEASURE_TIME=600 # milliseconds
+
+function kill_jpp() {
+	jps | grep $1 | cut -d ' ' -f 1 | xargs kill -9
+}
+
+CKP_INTV_LIST=(5000 10000 15000)
+TIMES_PER_TEST=5
+

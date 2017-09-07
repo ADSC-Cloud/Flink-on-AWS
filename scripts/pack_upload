@@ -1,0 +1,98 @@
+#!/bin/zsh
+
+echo "Are you sure that you have updated and sourced ~/.zshrc?"
+read $ANS
+
+. ./config
+
+function echo_help() {
+	echo "Usage:"
+	echo "./pack_upload [-e] [2|3]"
+	echo "Option:"
+	echo "-e: package is already existed"
+	exit 1
+}
+
+function do_pack() {
+	if [[ -d $PACK_NAME ]]; then
+		rm -rf $PACK_NAME
+	fi
+	mkdir -p $PACK_NAME
+	echo "copying files to $PACK_NAME..."
+	cp init reinit config run multi_run stop-all $PACK_NAME
+	cp -r $LO_METRIC_DIR $LN_METRIC_DIR
+	#mkdir -p $LN_UTILTOOL_DIR
+	#cp -r $LO_UTILTOOL_DIR/target/$UTILTOOL_NAME $LN_UTILTOOL_DIR
+	#cp -r $LO_UTILTOOL_DIR/stop $LN_UTILTOOL_DIR
+	if $NEED_KAFKA; then
+		cp -r $LO_KAFKA_DIR $LN_KAFKA_DIR
+	fi
+	if $NEED_FLINK; then
+		cp -r $LO_FLINK_DIR $LN_FLINK_DIR
+	fi
+	if $NEED_HADOOP; then
+		cp -r $LO_HADOOP_DIR $LN_HADOOP_DIR
+	fi
+	cp $LO_APP_PATH $LN_APP_PATH
+	echo "packaging..."
+	tar zcf $PACK_NAME.tar.gz $PACK_NAME
+}
+
+###################################################################################
+############################# in ~/.zshrc #########################################
+# export AWS_USERNAME="ubuntu"
+# export AWS_MASTER="ec2-ip.eu-west-1.compute.amazonaws.com"
+# export AWS_SSHOPT="-o StrictHostKeyChecking=no -i ~/.ssh/flink-cluster.pem"
+# function sshx() {
+# 	bash -c "ssh $AWS_SSHOPT -N -L 8157:$AWS_MASTER:8081 $AWS_USERNAME@$AWS_MASTER"
+# }
+# function saws() {
+# 	bash -c "ssh $AWS_SSHOPT $AWS_USERNAME@$AWS_MASTER \"$1\""
+# }
+# function scpi() {
+# 	local AWS_FILE=`echo $2 | sed -e "s,${HOME},/home/hadoop,g"`
+# 	bash -c "scp -r $AWS_SSHOPT $1 $AWS_USERNAME@$AWS_MASTER:$AWS_FILE"
+# }
+###################################################################################
+
+if [[ $# -eq 0 ]]; then
+	do_pack
+	SCPI=scpi
+	SAWS=saws
+elif [[ $# -eq 1 ]]; then
+	if [[ $1 == "2" ]]; then
+		do_pack
+		SCPI=scpi2
+		SAWS=saws2
+	elif [[ $1 == "3" ]]; then
+		do_pack
+		SCPI=scpi3
+		SAWS=saws3
+	elif [[ $1 == "-e" ]]; then
+		SCPI=scpi
+		SAWS=saws
+	else
+		echo_help
+	fi
+elif [[ $# -eq 2 ]]; then
+	if [[ ($1 == "2" && $2 == "-e") || ($1 == "-e" && $2 == "2") ]]; then
+		SCPI=scpi2
+		SAWS=saws2
+	elif [[ ($1 == "3" && $2 == "-e") || ($1 == "-e" && $2 == "3") ]]; then
+		SCPI=scpi3
+		SAWS=saws3
+	else
+		echo_help
+	fi
+else
+	echo_help
+fi
+
+. ~/.zshrc
+
+$SCPI ~/.mytaste/ut
+$SCPI $PACK_NAME.tar.gz
+$SAWS "tar zxf $PACK_NAME.tar.gz; mkdir -p ~/.aws; exit"
+$SCPI ~/.ssh/flink-cluster.pem ~/.ssh/
+$SCPI ~/.aws/credentials ~/.aws/
+
