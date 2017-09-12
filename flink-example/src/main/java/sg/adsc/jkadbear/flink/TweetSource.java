@@ -1,19 +1,3 @@
-/*
- * Copyright 2015 data Artisans GmbH
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *  http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package sg.adsc.jkadbear.flink;
 
 import com.amazonaws.auth.profile.ProfileCredentialsProvider;
@@ -24,6 +8,7 @@ import com.amazonaws.services.s3.AmazonS3Client;
 import com.amazonaws.services.s3.model.GetObjectRequest;
 import com.amazonaws.services.s3.model.S3Object;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.watermark.Watermark;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,117 +35,158 @@ import java.io.*;
  */
 public class TweetSource implements SourceFunction<String> {
 
-    private static final Logger LOG = LoggerFactory.getLogger(TweetSource.class);
+	private static final Logger LOG = LoggerFactory.getLogger(TweetSource.class);
 
 	private final int watermarkDelayMSecs;
 
 	private final String dataFilePath;
 	private final int servingSpeed;
+	private final int batchTimeInteval;
+	private final int batchPerSec;
+	private final int watermarkerInterval;
+	private final int wmCntPerSecond;
 
 	private transient BufferedReader reader;
-    private boolean isRunning;
+	private boolean isRunning;
+	private boolean isS3;
 
-	/**
-	 * Serves the String records from the specified and ordered gzipped input file.
-	 * Rides are served exactly in order of their time stamps
-	 * at the speed at which they were originally geneservingSpeedd.
-	 *
-	 * @param dataFilePath The gzipped input file from which the String records are read.
-	 */
-	public TweetSource(String dataFilePath) {
-		this(dataFilePath, 1);
+	public TweetSource(String dataFilePath, int servingSpeedFactor) {
+		this(dataFilePath, servingSpeedFactor, false);
 	}
 
-	/**
-	 * Serves the String records from the specified and ordered gzipped input file.
-	 * Rides are served exactly in order of their time stamps
-	 * in a serving speed which is proportional to the specified serving speed factor.
-	 *
-	 * @param dataFilePath The gzipped input file from which the String records are read.
-	 * @param servingSpeedFactor The serving speed factor by which the logical serving time is adjusted.
-	 */
-	public TweetSource(String dataFilePath, int servingSpeedFactor) {
-        this.dataFilePath = dataFilePath;
-        this.watermarkDelayMSecs = 10000;
-        this.servingSpeed = servingSpeedFactor;
-        this.isRunning = true;
+	public TweetSource(String dataFilePath, int servingSpeedFactor, boolean isS3) {
+		this.batchPerSec = 10;
+		if (servingSpeedFactor / this.batchPerSec < 1) {
+			throw new IllegalArgumentException(String.format("rate must be larger than %d", this.batchPerSec));
+		}
+		this.dataFilePath = dataFilePath;
+		this.watermarkDelayMSecs = 10000;
+		this.batchTimeInteval = 1000 / this.batchPerSec; // ms
+		this.watermarkerInterval = 100; // ms
+		this.wmCntPerSecond = 1000 / this.watermarkerInterval;
+		this.servingSpeed = servingSpeedFactor / (1000 / this.batchTimeInteval);
+		this.isRunning = true;
+		this.isS3 = isS3;
 	}
 
 	@Override
 	public void run(SourceContext<String> sourceContext) throws Exception {
 
-
-        generateSpeedOrderedStream(sourceContext);
+		generateSpeedOrderedStream(sourceContext);
 
 		this.reader.close();
 		this.reader = null;
 	}
 
 	private void generateSpeedOrderedStream(SourceContext<String> sourceContext) throws Exception {
-	    long totalSize = 0;
-        long totalSentEle = 0;
-        int emptyCnt = -1; // because first line of the source file is empty, set -1 to ensure the first batch size
+		long totalSize = 0;
+		long totalSentEle = 0;
+		int emptyCnt = -1; // because first line of the source file is empty, set -1 to ensure the first batch size
+		long markerCnt = 0;
 
-        long markerId = -1;
-        long wakeupTime;
-        long batchTimeInteval = 1000; // 1000 ms
+		long markerId = -1;
+		long startTime = System.currentTimeMillis();
+		long wakeupTime = System.currentTimeMillis();
 
+		class WaterMarkerGenerator extends Thread {
+			private Long markerId;
+			private Long markerCnt;
+
+			private WaterMarkerGenerator() {
+				this.markerId = -1L;
+				this.markerCnt = 0L;
+			}
+
+			@Override
+			public void run() {
+				while (isRunning) {
+					long now = System.currentTimeMillis();
+//                    sourceContext.emitWatermark(new Watermark(now));
+					sourceContext.emitWatermark(new Watermark(now - (now % watermarkerInterval)));
+					markerCnt++;
+					if (markerCnt % wmCntPerSecond == 0) {
+						LOG.info(String.format("#*FROMSOURCE\t%d %d", markerId, System.currentTimeMillis()));
+//                        System.out.println(String.format("#*FROMSOURCE\t%d %d", markerId, now));
+						String markerStr = String.format("%032d%032d", markerId--, now - (now % watermarkerInterval));
+						sourceContext.collectWithTimestamp(markerStr, now - (now % watermarkerInterval));
+					}
+					try {
+						Thread.sleep(watermarkerInterval);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+				}
+			}
+		}
+
+		// generate watermarker
+//        new WaterMarkerGenerator().start();
+
+		boolean first = true;
 		while (isRunning) {
-            try {
-                if (false) {
-                    AmazonS3 s3 = new AmazonS3Client(new ProfileCredentialsProvider());
-                    s3.setRegion(Region.getRegion(Regions.EU_WEST_1));
-                    S3Object s3object = s3.getObject(new GetObjectRequest("flink-cluster", "splittweetstream.txt"));
-                    reader = new BufferedReader(new InputStreamReader(s3object.getObjectContent()));
-                }
-                else {
-                    reader = new BufferedReader(new FileReader(new File(dataFilePath)));
-                }
-            } catch (FileNotFoundException e) {
-                e.printStackTrace();
-            }
+			try {
+				if (isS3) {
+					AmazonS3 s3 = new AmazonS3Client(new ProfileCredentialsProvider());
+					s3.setRegion(Region.getRegion(Regions.EU_WEST_1));
+					String bucket = dataFilePath.split("/")[2];
+					String endpoint = dataFilePath.split("/")[3];
+					S3Object s3object = s3.getObject(new GetObjectRequest(bucket, endpoint));
+					reader = new BufferedReader(new InputStreamReader(s3object.getObjectContent()));
+				}
+				else {
+					reader = new BufferedReader(new FileReader(new File(dataFilePath)));
+				}
+			} catch (FileNotFoundException e) {
+				e.printStackTrace();
+			}
 
 			try {
-                wakeupTime = System.currentTimeMillis();
+				if (first) {
+					startTime = System.currentTimeMillis();
+					wakeupTime = startTime;
+					first = false;
+				}
 				String line;
 				while ((line = reader.readLine()) != null && isRunning) {
 					if (emptyCnt == servingSpeed) {
-						// emit BatchMarker
-						String markerStr = String.format("%032d%032d%032d", markerId--, System.currentTimeMillis(), wakeupTime);
-//                        LOG.info("markerStr: " + markerStr);
-
-						// send 3 markers
-						for (int i = 0; i < 3; i++) {
-							sourceContext.collect(markerStr);
+						markerCnt++;
+						// emit 1 BatchMarker
+						if (markerCnt % 10 == 0) {
+							long now = System.currentTimeMillis();
+							LOG.info(String.format("#*FROMSOURCE\t%d %d", markerId, now));
+							String markerStr = String.format("%032d%032d", markerId--, now);
+							sourceContext.collectWithTimestamp(markerStr, now);
 						}
-//                            LOG.info(String.format("During the last %d ms, we sent %d elements. Sending Rate: %.2f tuples/sec, %.3f MB/sec.",
-//                                    System.currentTimeMillis() - wakeupTime, totalSentEle,
-//                                    totalSentEle * batchTimeInteval / 1000.0,
-//                                    totalSize * batchTimeInteval / 1000.0 / 1024 / 1024));
-                        long sleepTime = batchTimeInteval - (System.currentTimeMillis() - wakeupTime);
-                        if (sleepTime > 0) {
-//                            LOG.info("SleepTime: " + sleepTime + "ms");
-                            Thread.sleep(sleepTime);
-                        } else {
-                            LOG.warn(String.format("negative sleeptime: %dms, no enough time to emit a batch", sleepTime));
-                        }
-//                        sourceContext.emitWatermark(new Watermark(System.currentTimeMillis()));
+
+						long cTime = System.currentTimeMillis();
+						long sleepTime = batchTimeInteval - (cTime - wakeupTime);
+						if (sleepTime > 0) {
+							Thread.sleep(sleepTime);
+//                            LOG.info(String.format("sleeptime: %dms (cTime: %dms, wTime: %dms)", sleepTime, cTime, wakeupTime));
+						} else {
+							LOG.info(String.format("markerId: %d, negative sleeptime: %dms (cTime: %dms, wTime: %dms), no enough time to emit a batch",
+									markerId, sleepTime, cTime, wakeupTime));
+							LOG.info(String.format("Throughput: %.2f MB/s", totalSize / 1024 / 1024 / ((cTime - startTime)/1000.0)));
+						}
+
+//                        long now = System.currentTimeMillis();
+//                        sourceContext.emitWatermark(new Watermark(now - watermarkerInterval));
+
 						emptyCnt = 0;
-						totalSize = 0;
-						totalSentEle = 0;
-                        wakeupTime = System.currentTimeMillis();
+						wakeupTime += batchTimeInteval;
 					}
-                    if (line.equals(" ")) {
-                        emptyCnt++;
-                        continue;
-                    }
-                    totalSentEle++;
-                    totalSize += (double) line.getBytes().length;
-                    sourceContext.collect(String.format("%032d%032d%s", -markerId, System.currentTimeMillis(), line));
+					if (line.equals(" ")) {
+						emptyCnt++;
+						continue;
+					}
+					totalSentEle++;
+					totalSize += (double) line.getBytes().length;
+					Long timeStamp = System.currentTimeMillis();
+					sourceContext.collectWithTimestamp(String.format("%032d%032d%s", 1, timeStamp, line), timeStamp);
 				}
 				reader.close();
 				reader = null;
-			} catch (IOException | InterruptedException e) {
+			} catch (IOException e) {
 				e.printStackTrace();
 			}
 		}
@@ -176,9 +202,8 @@ public class TweetSource implements SourceFunction<String> {
 			throw new RuntimeException("Could not cancel SourceFunction", ioe);
 		} finally {
 			this.reader = null;
-            isRunning = false;
+			isRunning = false;
 		}
 	}
 
 }
-

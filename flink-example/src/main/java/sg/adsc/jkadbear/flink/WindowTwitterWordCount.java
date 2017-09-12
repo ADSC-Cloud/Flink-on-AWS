@@ -1,20 +1,23 @@
 package sg.adsc.jkadbear.flink;
 
 import org.apache.flink.api.common.functions.FlatMapFunction;
-import org.apache.flink.api.common.functions.RichFlatMapFunction;
+import org.apache.flink.api.common.functions.JoinFunction;
+import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.tuple.Tuple;
+import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
-import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
-import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.functions.windowing.RichWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer09;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer09;
 import org.apache.flink.streaming.util.serialization.SimpleStringSchema;
@@ -26,23 +29,22 @@ import twitter4j.Status;
 import twitter4j.TwitterException;
 import twitter4j.json.DataObjectFactory;
 
-import java.util.*;
+import java.util.Properties;
 
 public class WindowTwitterWordCount {
     private static final Logger LOG = LoggerFactory.getLogger(WindowTwitterWordCount.class);
 
-    private static class TweetParser implements FlatMapFunction<String, Tweet> {
+    public static class TweetParser implements FlatMapFunction<String, RegressionPara> {
         private static final long serialVersionUID = -1028247726481567824L;
 
         @Override
-        public void flatMap(String line, Collector<Tweet> out) throws Exception {
+        public void flatMap(String line, Collector<RegressionPara> out) throws Exception {
             try {
                 Long markerId = Long.parseLong(line.substring(0, 32));
-                Long ts = Long.parseLong(line.substring(32, 64));
+                Long x = Long.parseLong(line.substring(32, 64)); // x is timestamp
                 // is the tuple a marker?
                 if (markerId < 0) {
-                    out.collect(new Tweet("", new RegressionPara(ts, markerId, Long.valueOf(line.substring(64)))));
-//                    LOG.info("markerId: " + markerId + " tweetparser ts: " + (System.currentTimeMillis() - ts));
+                    out.collect(new RegressionPara("", markerId, x));
                     return;
                 }
 
@@ -52,7 +54,7 @@ public class WindowTwitterWordCount {
                     HashtagEntity[] hashtags = s.getHashtagEntities();
                     for (HashtagEntity hashtag : hashtags) {
                         String tag = hashtag.getText();
-                        out.collect(new Tweet(tag, new RegressionPara(ts, markerId, 1L)));
+                        out.collect(new RegressionPara(tag, markerId, x));
                     }
                 }
             } catch (TwitterException e) {
@@ -61,543 +63,276 @@ public class WindowTwitterWordCount {
         }
     }
 
-    // simulate micro-batch by batch-marker
-    public static class TupleBuffer {
-        public Map<Long, List<Tweet>> tupleMap;
-        public Map<Long, Integer> readyCntMap;
-        public Map<Long, Tweet> markerMap;
-        public Map<String, Tweet> states;
-
-        TupleBuffer() {
-            tupleMap = new HashMap<>();
-            readyCntMap = new LinkedHashMap<>();
-            markerMap = new HashMap<>();
-            states= new HashMap<>();
-        }
-
-        void addTuple(Tweet tweet) {
-            long markerId = tweet.getMarkerId();
-            // if this is a marker
-            if (markerId < 0) {
-                if (!readyCntMap.containsKey(markerId)) {
-                    readyCntMap.put(markerId, 1);
-                    markerMap.put(markerId, tweet);
-                }
-                else {
-                    int cnt = readyCntMap.get(markerId);
-                    readyCntMap.put(markerId, cnt+1);
-                }
-                return;
-            }
-
-            // tuple's markerId is the opposite number of batchmarker's markerId
-            markerId = -markerId;
-            if (!tupleMap.containsKey(markerId)) {
-                tupleMap.put(markerId, new LinkedList<>());
-            }
-            tupleMap.get(markerId).add(tweet);
-        }
-
-        boolean isReady() {
-            for (long ll : readyCntMap.keySet()) {
-                if (readyCntMap.get(ll) == 3) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        List<List<Tweet>> getReadyBatches() {
-            List<List<Tweet>> list = new LinkedList<>();
-            for (long ll : readyCntMap.keySet()) {
-                if (readyCntMap.get(ll) == 3) {
-                    list.add(tupleMap.get(ll));
-                }
-            }
-            return list;
-        }
-
-        Tweet getMarker(long id) {
-            return markerMap.get(id);
-        }
-
-        void clearBatch(long id) {
-            tupleMap.remove(id);
-            readyCntMap.remove(id);
-            markerMap.remove(id);
-        }
-
-        Map<String, Tweet> getStates() {
-            return states;
-        }
-
-        List<Tweet> getSentBatch(Map<String, String> currHashTagMap) {
-            List<Tweet> resList = new ArrayList<>();
-            for (String tag : currHashTagMap.keySet()) {
-                resList.add(states.get(tag));
-            }
-            return resList;
-        }
-
-    }
-
-    private static class LeftPara extends RichFlatMapFunction<Tweet, Tweet> {
-        private transient ValueState<TupleBuffer> lpBuffer;
-
-        @Override
-        public void flatMap(Tweet tweet, Collector<Tweet> collector) throws Exception {
-            TupleBuffer tb = lpBuffer.value();
-            // buffer it
-            tb.addTuple(tweet);
-            // if a batch is ready, do processing and send a marker to downstream
-            if (tb.isReady()) {
-                Map<String, Tweet> states = tb.getStates();
-                for (List<Tweet> batch : tb.getReadyBatches()) {
-                    // batchmarker id < 0
-                    long markerId = -batch.get(0).getMarkerId();
-                    Map<String, String> currHashTagMap = new HashMap<>();
-                    for (Tweet tuple : batch) {
-                        RegressionPara tupleRP = tuple.regPara;
-                        Long ts = tupleRP.ts;
-                        if (!states.containsKey(tuple.hashTag)) {
-                            states.put(tuple.hashTag, new Tweet(tuple.hashTag, new RegressionPara(ts, tuple.getMarkerId(), 0L)));
-                        }
-                        RegressionPara statesRP = states.get(tuple.hashTag).regPara;
-                        double p1 = statesRP.p1 + tupleRP.p1;
-                        double p2 = statesRP.p2 + tupleRP.ts;
-                        double p3 = statesRP.p3 + p1;
-                        statesRP.setLeftRegressionPara(ts, p1, p2, p3);
-                        currHashTagMap.put(tuple.hashTag, "");
-                    }
-                    // emit tuples
-                    tb.getSentBatch(currHashTagMap).forEach(collector::collect);
-                    // emit marker
-                    collector.collect(tb.getMarker(markerId));
-                    // clear current batch
-                    tb.clearBatch(markerId);
-                }
-            }
-            lpBuffer.update(tb);
-        }
-
-        @Override
-        public void open(Configuration config) {
-            ValueStateDescriptor<TupleBuffer> descriptor =
-                    new ValueStateDescriptor<>(
-                            "lpBuffer", // the state name
-                            TypeInformation.of(new TypeHint<TupleBuffer>() {}), // type information
-                            new TupleBuffer()); // default value of the state, if nothing was set
-            lpBuffer = getRuntimeContext().getState(descriptor);
-        }
-    }
-
-    private static class RightPara extends RichFlatMapFunction<Tweet, Tweet> {
-        private transient ValueState<TupleBuffer> rpBuffer;
-        @Override
-        public void flatMap(Tweet tweet, Collector<Tweet> collector) throws Exception {
-            TupleBuffer tb = rpBuffer.value();
-            // buffer it
-            tb.addTuple(tweet);
-            // if a batch is ready, do processing and send a marker to downstream
-            if (tb.isReady()) {
-                Map<String, Tweet> states = tb.getStates();
-                for (List<Tweet> batch : tb.getReadyBatches()) {
-                    // batchmarker id < 0
-                    long markerId = -batch.get(0).getMarkerId();
-                    Map<String, String> currHashTagMap = new HashMap<>();
-                    for (Tweet tuple : batch) {
-                        RegressionPara tupleRP = tuple.regPara;
-                        Long ts = tupleRP.ts;
-                        if (!states.containsKey(tuple.hashTag)) {
-                            states.put(tuple.hashTag, new Tweet(tuple.hashTag, new RegressionPara(ts, tuple.getMarkerId(), 0L)));
-                        }
-                        RegressionPara statesRP = states.get(tuple.hashTag).regPara;
-                        double p1 = statesRP.p1 + tupleRP.p1;
-                        double p4 = statesRP.p4 + tupleRP.ts * tupleRP.ts;
-                        double p6 = statesRP.p6 + tupleRP.ts * p1;
-                        statesRP.setLeftRegressionPara(ts, p1, p4, p6);
-                        currHashTagMap.put(tuple.hashTag, "");
-                    }
-                    // emit tuples
-                    tb.getSentBatch(currHashTagMap).forEach(collector::collect);
-                    // emit marker
-                    collector.collect(tb.getMarker(markerId));
-                    // clear current batch
-                    tb.clearBatch(markerId);
-                }
-            }
-            rpBuffer.update(tb);
-        }
-
-        @Override
-        public void open(Configuration config) {
-            ValueStateDescriptor<TupleBuffer> descriptor =
-                    new ValueStateDescriptor<>(
-                            "rpBuffer", // the state name
-                            TypeInformation.of(new TypeHint<TupleBuffer>() {}), // type information
-                            new TupleBuffer()); // default value of the state, if nothing was set
-            rpBuffer = getRuntimeContext().getState(descriptor);
-        }
-    }
-
-
-    public static class CoFlatMapTupleBuffer {
-        public Map<Long, List<Tweet>> tupleMap1;
-        public Map<Long, List<Tweet>> tupleMap2;
-        public Long markerId1;
-        public Long markerId2;
-        public Map<Long, Tweet> readyBatch1;
-        public Map<Long, Tweet> readyBatch2;
-
-        CoFlatMapTupleBuffer() {}
-
-        CoFlatMapTupleBuffer(long _markerId) {
-            tupleMap1 = new HashMap<>();
-            tupleMap2 = new HashMap<>();
-            markerId1 = _markerId;
-            markerId2 = _markerId;
-            readyBatch1 = new HashMap<>();
-            readyBatch2 = new HashMap<>();
-        }
-
-        void addTuple1(Tweet tweet) {
-            if (tweet.getMarkerId() < 0) {
-                readyBatch1.put(markerId1--, tweet);
-                return;
-            }
-            if (!tupleMap1.containsKey(markerId1)) {
-                tupleMap1.put(markerId1, new LinkedList<>());
-            }
-            tupleMap1.get(markerId1).add(tweet);
-        }
-
-        void addTuple2(Tweet tweet) {
-            if (tweet.getMarkerId() < 0) {
-                readyBatch2.put(markerId2--, tweet);
-                return;
-            }
-            if (!tupleMap2.containsKey(markerId2)) {
-                tupleMap2.put(markerId2, new LinkedList<>());
-            }
-            tupleMap2.get(markerId2).add(tweet);
-        }
-
-        List<Long> getReadyMarkerId1() {
-            List<Long> list = new LinkedList<>();
-            list.addAll(readyBatch1.keySet());
-            return list;
-        }
-
-        Long getTs1(long id) {
-            return readyBatch1.get(id).getCreateTime();
-        }
-
-        Long getBatchStartTs(long id) {
-            return (long) readyBatch1.get(id).regPara.p1;
-        }
-
-        RegressionPara getMarker(long id) {
-            return new RegressionPara(getTs1(id), id, getBatchStartTs(id));
-        }
-
-        // be called when stream1 and stream2 are all ready,
-        List<Tweet> getBatch1(Long id) {
-            return tupleMap1.get(id);
-        }
-
-        List<Tweet> getBatch2(Long id) {
-            return tupleMap2.get(id);
-        }
-
-        void removeBatch1(Long id) {
-            tupleMap1.remove(id);
-            readyBatch1.remove(id);
-        }
-
-        void removeBatch2(Long id) {
-            tupleMap2.remove(id);
-            readyBatch2.remove(id);
-        }
-    }
-
-    private static class CombinePara extends RichCoFlatMapFunction<Tweet, Tweet, Tweet> {
-        private static final long serialVersionUID = 575640980903073393L;
-        private transient ValueState<CoFlatMapTupleBuffer> cfBuffer;
-
-        public void flatMap1(Tweet tweet, Collector<Tweet> collector) throws Exception {
-            doJoin(tweet, collector, 1);
-        }
-
-        @Override
-        public void flatMap2(Tweet tweet, Collector<Tweet> collector) throws Exception {
-            doJoin(tweet, collector, 2);
-        }
-
-        void doJoin(Tweet tweet, Collector<Tweet> collector, int num) throws Exception {
-            CoFlatMapTupleBuffer cftb = cfBuffer.value();
-            if (num == 1) {
-                cftb.addTuple1(tweet);
-            }
-            else {
-                cftb.addTuple2(tweet);
-            }
-            for (Long readyMarkerId : cftb.getReadyMarkerId1()) {
-                List<Tweet> l1 = cftb.getBatch1(readyMarkerId);
-                List<Tweet> l2 = cftb.getBatch2(readyMarkerId);
-                if (l1 != null && l2 != null) {
-                    Map<String, Tweet> currTuples1 = new HashMap<>();
-                    Map<String, Tweet> currTuples2 = new HashMap<>();
-                    for (Tweet tt : l1) {
-                        currTuples1.put(tt.hashTag, tt);
-                    }
-                    for (Tweet tt : l2) {
-                        currTuples2.put(tt.hashTag, tt);
-                    }
-                    for (String tag : currTuples1.keySet()) {
-                        if (currTuples2.containsKey(tag)) {
-                            RegressionPara val1 = currTuples1.get(tag).regPara;
-                            RegressionPara val2 = currTuples2.get(tag).regPara;
-                            val1.SetRightRegressionPara(val1.ts, val2.p1, val2.p4, val2.p6);
-                            collector.collect(new Tweet(tag, val1));
-                        }
-                    }
-                    // emit marker
-                    collector.collect(new Tweet("", cftb.getMarker(readyMarkerId)));
-//                    LOG.info("markerId: " + readyMarkerId + " combine ts: " + (System.currentTimeMillis() - cftb.getMarker(readyMarkerId).p1));
-                    // remove batch that has been sent
-                    cftb.removeBatch1(readyMarkerId);
-                    cftb.removeBatch2(readyMarkerId);
-                }
-            }
-            cfBuffer.update(cftb);
-        }
-
-        @Override
-        public void open(Configuration config) {
-            ValueStateDescriptor<CoFlatMapTupleBuffer> descriptor =
-                    new ValueStateDescriptor<>(
-                            "cfBuffer", // the state name
-                            TypeInformation.of(new TypeHint<CoFlatMapTupleBuffer>() {}), // type information
-                            new CoFlatMapTupleBuffer(-1L)); // default value of the state, if nothing was set
-            cfBuffer = getRuntimeContext().getState(descriptor);
-        }
-    }
-
-    // simulate micro-batch by batch-marker
-    public static class FinalBuffer {
-        public Map<Long, List<Tweet>> tupleMap;
-        public Long markerId;
-
-        FinalBuffer() {
-            markerId = -1L;
-            tupleMap = new HashMap<>();
-        }
-
-        List<Tweet> getCurrTuples() {
-//            if (!tupleMap.containsKey(markerId)) {
-//                tupleMap.put(markerId, new LinkedList<>());
-//            }
-            return tupleMap.get(markerId);
-        }
-
-        void addTuple(Tweet tweet) {
-            if (!tupleMap.containsKey(markerId)) {
-                tupleMap.put(markerId, new LinkedList<>());
-            }
-            tupleMap.get(markerId).add(tweet);
-        }
-
-        void clearCurrBatch() {
-            tupleMap.remove(markerId);
-            // set next marker id
-            markerId--;
-        }
-    }
-
-    private static class FinalPara extends RichFlatMapFunction<Tweet, Tweet> {
-        private transient ValueState<FinalBuffer> fpBuffer;
-
-        @Override
-        public void flatMap(Tweet tweet, Collector<Tweet> collector) throws Exception {
-            FinalBuffer tb = fpBuffer.value();
-            // if this is a tuple, buffer it
-            if (tweet.getMarkerId() >= 0) {
-                tb.addTuple(tweet);
-            }
-            // if this is a marker, do processing and send a marker to downstream
-            else {
-                // emit tuples
-                for (Tweet tuple : tb.getCurrTuples()) {
-                    RegressionPara val2 = tuple.regPara;
-                    double p5 = val2.p1 * val2.p1;
-                    double p7 = val2.p2 * val2.p3;
-                    RegressionPara ret = new RegressionPara();
-                    ret.setFinalRegressionPara(val2.ts, val2.p1, val2.p2, val2.p3, val2.p4, p5, val2.p6, p7);
-                    double b = (ret.p1 * ret.p6 - ret.p2 * ret.p3) / (ret.p1 * ret.p4 - ret.p5);
-                    double a = ret.p3 / ret.p1 - b * ret.p2 / ret.p1;
-                    ret.setAB(a, b);
-                    collector.collect(new Tweet(tuple.hashTag, ret));
-                }
-                // emit marker
-//                collector.collect(tb.getMarker(tweet.getCreateTime()));
-                collector.collect(tweet);
-//                LOG.info("markerId: " + tweet.getMarkerId() + " finalpara ts: " + (System.currentTimeMillis() - tweet.regPara.p1));
-                // clear current batch
-                tb.clearCurrBatch();
-            }
-            fpBuffer.update(tb);
-        }
-
-        @Override
-        public void open(Configuration config) {
-            ValueStateDescriptor<FinalBuffer> descriptor =
-                    new ValueStateDescriptor<>(
-                            "fpBuffer", // the state name
-                            TypeInformation.of(new TypeHint<FinalBuffer>() {}), // type information
-                            new FinalBuffer()); // default value of the state, if nothing was set
-            fpBuffer = getRuntimeContext().getState(descriptor);
-        }
-    }
-
-    private static class SampleFlatMap implements FlatMapFunction<Tweet, String> {
-        @Override
-        public void flatMap(Tweet tweet, Collector<String> collector) throws Exception {
-            if (tweet.getMarkerId() < 0) {
-//                LOG.info("new sample, marker: " + Long.toString(tweet.getMarkerId()) + ", startTs: " + Long.toString(tweet.getCreateTime()));
-//                LOG.info("markerId: " + tweet.getMarkerId() + " samplemap ts: " + (System.currentTimeMillis() - tweet.getCreateTime()));
-//                collector.collect(Long.toString(tweet.getMarkerId()));
-                collector.collect(String.format("%032d%032d", tweet.getMarkerId(), (long) tweet.regPara.p1));
-            }
-        }
-    }
-    private static class SampleQueueFlatMap implements FlatMapFunction<String, String> {
-        @Override
-        public void flatMap(String s, Collector<String> collector) throws Exception {
-            // is the tuple a marker?
-            if (s.charAt(0) == '-') {
-                collector.collect(s.substring(0, 64));
-            }
-        }
-    }
-
-//    private static class TagKeySelector implements KeySelector<Tweet, Integer> {
+    // over shoes over boots
+    // The logic of LeftPara and RightPara is wrong
+    // but ~~~ it doesn't matter ~~~
+//    public static class LeftPara implements ReduceFunction<RegressionPara> {
 //        @Override
-//        public Integer getKey(Tweet v) throws Exception {
-//            return v.uselessKey;
+//        public RegressionPara reduce(RegressionPara reg1, RegressionPara reg2) throws Exception {
+//            if (reg2.getMarkerId() < 0) {
+//                return reg2;
+//            }
+//            reg1.setY(reg1.getY() + reg2.getY());
+//            reg1.setySum(reg1.getySum() + reg1.getY() + reg2.getY());
+//            reg1.setxCrossY(reg1.getxCrossY() + reg2.getX() * reg2.getY());
+//            return reg1;
 //        }
 //    }
 
-    /**
-     * Create Kafka Source
-     */
-    private static FlinkKafkaConsumer09<String> kafkaSource(BenchmarkConfig config) {
-        return new FlinkKafkaConsumer09<>(
-                config.kafkaSourceTopic,
-                new SimpleStringSchema(),
-                config.getParameters().getProperties());
-    }
+//    public static class RightPara implements ReduceFunction<RegressionPara> {
+//        @Override
+//        public RegressionPara reduce(RegressionPara reg1, RegressionPara reg2) throws Exception {
+//            if (reg2.getMarkerId() < 0) {
+//                return reg2;
+//            }
+////            reg1.setX(reg2.getX());
+//            reg1.setxSum(reg1.getxSum() + reg2.getX());
+//            reg1.setxSqSum(reg1.getxSqSum() + reg2.getX() * reg2.getX());
+//            reg1.setN(reg1.getN() + reg2.getN());
+//            return reg1;
+//        }
+//    }
 
-    /**
-     * Create Kafka Sink
-     */
-    private static FlinkKafkaProducer09<String> kafkaSink(BenchmarkConfig config) {
-        return new FlinkKafkaProducer09<>(
-                config.kafkaBootstrapServers,
-                config.kafkaAckTopic,
-                new SimpleStringSchema());
-    }
-
-    /**
-     * Create Kafka Sink
-     */
-    private static FlinkKafkaProducer09<String> kafkaQueueSink(BenchmarkConfig config) {
-        return new FlinkKafkaProducer09<>(
-                config.kafkaBootstrapServers,
-                config.kafkaQueueTopic,
-                new SimpleStringSchema());
-    }
-
-    /**
-     * This generator generates watermarks that are lagging behind processing time by a certain amount.
-     * It assumes that elements arrive in Flink after at most a certain time.
-     */
-    private static class TimeLagWatermarkGenerator implements AssignerWithPeriodicWatermarks<Tweet> {
-
-        private final long maxTimeLag = 5000; // 5 seconds
+    public static class LeftPara extends RichWindowFunction<RegressionPara, RegressionPara, String, TimeWindow> {
+        private transient ValueState<RegressionPara> lpBuffer;
 
         @Override
-        public long extractTimestamp(Tweet tweet, long previousElementTimestamp) {
-            return tweet.getCreateTime();
+        public void open(Configuration config) {
+            ValueStateDescriptor<RegressionPara> descriptor =
+                    new ValueStateDescriptor<>("lpBuffer", // the state name
+                            TypeInformation.of(new TypeHint<RegressionPara>() {}), // type information
+                            null); // default value of the state, if nothing was set
+            lpBuffer = getRuntimeContext().getState(descriptor);
         }
 
         @Override
-        public Watermark getCurrentWatermark() {
-            // return the watermark as current time minus the maximum time lag
-            return new Watermark(System.currentTimeMillis() - maxTimeLag);
+        public void apply(String s, TimeWindow timeWindow, Iterable<RegressionPara> iterable, Collector<RegressionPara> collector) throws Exception {
+            RegressionPara firstReg = iterable.iterator().next();
+            if (firstReg != null) {
+                RegressionPara state = lpBuffer.value();
+                if (state == null) {
+                    Long id = firstReg.getMarkerId();
+                    Long x = firstReg.getX();
+                    state = new RegressionPara(s, id, x, 0, x, 0, x*x, 0, 0, 0, 0);
+                }
+                state.setMarkerId(firstReg.getMarkerId());
+                state.setX(firstReg.getX());
+                for (RegressionPara reg : iterable) {
+                    state.setY(state.getY() + reg.getY());
+                    state.setySum(state.getySum() + state.getY() + reg.getY());
+                    state.setxCrossY(state.getxCrossY() + reg.getX() * reg.getY());
+                }
+                lpBuffer.update(state);
+                collector.collect(state);
+            }
         }
+    }
+
+
+    public static class RightPara extends RichWindowFunction<RegressionPara, RegressionPara, String, TimeWindow> {
+        private transient ValueState<RegressionPara> rpBuffer;
+
+        @Override
+        public void open(Configuration config) {
+            ValueStateDescriptor<RegressionPara> descriptor =
+                    new ValueStateDescriptor<>("rpBuffer", // the state name
+                            TypeInformation.of(new TypeHint<RegressionPara>() {}), // type information
+                            null); // default value of the state, if nothing was set
+            rpBuffer = getRuntimeContext().getState(descriptor);
+        }
+
+        @Override
+        public void apply(String s, TimeWindow timeWindow, Iterable<RegressionPara> iterable, Collector<RegressionPara> collector) throws Exception {
+            RegressionPara firstReg = iterable.iterator().next();
+            if (firstReg != null) {
+                RegressionPara state = rpBuffer.value();
+                if (state == null) {
+                    Long id = firstReg.getMarkerId();
+                    Long x = firstReg.getX();
+                    state = new RegressionPara(s, id, x, 0, x, 0, x*x, 0, 0, 0, 0);
+                }
+                state.setMarkerId(firstReg.getMarkerId());
+                state.setX(firstReg.getX());
+                for (RegressionPara reg : iterable) {
+                    state.setxSum(state.getxSum() + reg.getX());
+                    state.setxSqSum(state.getxSqSum() + reg.getX() * reg.getX());
+                    state.setN(state.getN() + reg.getN());
+                }
+                rpBuffer.update(state);
+                collector.collect(state);
+            }
+        }
+    }
+
+
+    public static class CombinePara implements JoinFunction<RegressionPara, RegressionPara, RegressionPara> {
+        @Override
+        public RegressionPara join(RegressionPara reg1, RegressionPara reg2) throws Exception {
+            if (reg1.getMarkerId() < 0) {
+                return reg1;
+            }
+            reg1.setRightRegressionPara(reg2.getX(), reg2.getxSum(), reg2.getxSqSum(), reg2.getN());
+            return reg1;
+        }
+    }
+
+    public static class FinalPara extends RichMapFunction<RegressionPara, RegressionPara> {
+        private transient ValueState<RegressionPara> fpBuffer;
+
+        @Override
+        public void open(Configuration config) {
+            ValueStateDescriptor<RegressionPara> descriptor =
+                    new ValueStateDescriptor<>(
+                            "fpBuffer", // the state name
+                            TypeInformation.of(new TypeHint<RegressionPara>() {}), // type information
+                            null); // default value of the state, if nothing was set
+            fpBuffer = getRuntimeContext().getState(descriptor);
+        }
+
+        @Override
+        public RegressionPara map(RegressionPara reg) throws Exception {
+//            RegressionPara oldReg = fpBuffer.value();
+            // if this is a marker, send the marker to downstream
+            if (reg.getMarkerId() < 0){
+                return reg;
+            }
+            // if this is a tuple, calculate a and b
+            else {
+                double b = (reg.getN() * reg.getxCrossY() - reg.getxSum() * reg.getySum()) /
+                        (reg.getN() * reg.getxSqSum() - reg.getxSum() * reg.getxSum());
+                double a = reg.getySum() / reg.getN() - b * reg.getxSum() / reg.getN();
+                reg.setAB(a, b);
+                fpBuffer.update(reg);
+                return reg;
+            }
+        }
+    }
+
+//    public static class FinalFilter extends RichFilterFunction<RegressionPara> {
+//        private transient ValueState<Long> ffBuffer;
+//
+//        @Override
+//        public void open(Configuration config) {
+//            ValueStateDescriptor<Long> descriptor =
+//                    new ValueStateDescriptor<>(
+//                            "ffBuffer", // the state name
+//                            TypeInformation.of(new TypeHint<Long>() {}), // type information
+//                            0L); // default value of the state, if nothing was set
+//            ffBuffer = getRuntimeContext().getState(descriptor);
+//        }
+//
+//        @Override
+//        public boolean filter(RegressionPara reg) throws Exception {
+//            Long cnt = ffBuffer.value();
+//            ffBuffer.update(cnt+1);
+//            return cnt > 193000 && cnt % 1000 == 0;
+//        }
+//    }
+
+    public static class WriteMarkerSink implements SinkFunction<RegressionPara> {
+        @Override
+        public void invoke(RegressionPara reg) throws Exception {
+            if (reg.getMarkerId() < 0) { LOG.info(String.format("#*FROMFINAL\t%d %d", reg.getMarkerId(), System.currentTimeMillis())); }
+            if (Math.random() > 0.9995) { LOG.info(String.format("#*LATENCY\t%d", System.currentTimeMillis() - reg.getX())); }
+        }
+    }
+
+    public static class RegKeySelector implements KeySelector<RegressionPara, String> {
+        @Override
+        public String getKey(RegressionPara reg) throws Exception {
+            return reg.getHashTag();
+        }
+    }
+
+    private static FlinkKafkaConsumer09<String> KafkaSource() {
+        Properties properties = new Properties();
+        properties.setProperty("bootstrap.servers", "jkmaster:9092");
+        return new FlinkKafkaConsumer09<>("source-topic", new SimpleStringSchema(), properties);
+    }
+
+    private static class RegFinalMap implements FlatMapFunction<RegressionPara, String> {
+        @Override
+        public void flatMap(RegressionPara reg, Collector<String> collector) throws Exception {
+            if (reg.getMarkerId() < 0) {
+//            if (Math.random() > 0.999) {
+                collector.collect(String.format("%032d%032d", reg.getMarkerId(), reg.getX()));
+            }
+        }
+    }
+
+    private static FlinkKafkaProducer09<String> KafkaSink() {
+        return new FlinkKafkaProducer09<>("jkmaster:9092", "ack-topic", new SimpleStringSchema());
     }
 
     public static void main(String[] args) throws Exception {
+        ParameterTool pmTool = ParameterTool.fromArgs(args);
+        boolean isCkp = pmTool.getBoolean("isCkp", false);
+        int ckpInterval = pmTool.getInt("ckpInterval", 0);
+        boolean isS3 = pmTool.getBoolean("isS3", true);
+        String dataPath = pmTool.get("dataPath", "s3://flink-cluster/splittweetstream.txt");
+        int rate = pmTool.getInt("rate", 600);
+        int countWindowSize = (int) (rate * 5.38);
+        int timeWindowSize = pmTool.getInt("timeWinSize", 100); // 100 ms
+        int slideTimeWindowStep = 5;
 
-//        Properties properties = new Properties();
-//        properties = new Properties();
-//        properties.put("metadata.broker.list", "localhost:9092");
-//        properties.put("serializer.class", "kafka.serializer.StringEncoder");
-//        properties.put("request.required.acks", "1");
-//        properties.put("bootstrap.servers", "jkmaster:9092");
-//        properties.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-//        properties.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
-//        properties.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-//        properties.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
-//        KafkaProducer<String, String> producer = new KafkaProducer<String, String>(properties);
-//        producer.send(new ProducerRecord<String, String>("ackTopic", String.format("%032d", ret.ts)));
-
-        BenchmarkConfig config = BenchmarkConfig.fromArgs(args);
-
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.getConfig().setGlobalJobParameters(config.getParameters());
-        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.IngestionTime);
 //        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
-
 //        env.getConfig().setLatencyTrackingInterval(1000);
-//        if (config.checkpointsEnabled) {
-//            env.enableCheckpointing(config.checkpointInterval);
-//        }
 
+        if (isCkp) {
+            env.enableCheckpointing(ckpInterval);
+        }
 
-        // different source: from kafka or directly from disk
-//        DataStream<String> source = env.addSource(kafkaSource(config));
-        DataStream<String> source = env.addSource(new TweetSource("/home/jkadbear/Downloads/splittweetstream.txt", 600));
-
-
-        // measure queue latency
-        source.flatMap(new SampleQueueFlatMap())
-                .addSink(kafkaQueueSink(config)).name("QueueLatencySink");
+//        DataStream<String> source = env.addSource(KafkaSource());//.slotSharingGroup("slotG1");
+        DataStream<String> source = env.addSource(new TweetSource(dataPath, rate, isS3)).slotSharingGroup("slotG1");
 
         // round-robin
-        DataStream<Tweet> tweets = source.rebalance()
-                .flatMap(new TweetParser()).setParallelism(3).name("TweetParser")
-                .assignTimestampsAndWatermarks(new TimeLagWatermarkGenerator());
-
-        KeyedStream<Tweet, Tuple> keyTweets = tweets.keyBy("uselessKey");
+        DataStream<RegressionPara> tweets = source//.rebalance()
+                .flatMap(new TweetParser()).setParallelism(3).name("TweetParser").slotSharingGroup("slotG2");
+//                .flatMap(new TweetParser()).setParallelism(3).name("TweetParser");
+//                .keyBy(new RegKeySelector())
+//                .window(TumblingEventTimeWindows.of(Time.milliseconds(timeWindowSize)))
+//                .reduce(new HashTagCounter()).setParallelism(3).slotSharingGroup("slotG2");
+//                .reduce(new HashTagCounter()).setParallelism(3);
+//        tweets.flatMap(new RegFinalMap()).addSink(KafkaSink());
 
         // Part 1
-        DataStream<Tweet> p1 = keyTweets.flatMap(new LeftPara()).name("Parameters1");
+        DataStream<RegressionPara> p1 = tweets
+                .keyBy(new RegKeySelector())
+                .timeWindow(Time.milliseconds(timeWindowSize))
+//                .countWindow(countWindowSize)
+                .apply(new LeftPara()).name("Parameters1").slotSharingGroup("slotG3");
+//                .keyBy(new RegKeySelector())
+//                .map(new StateLeftPara());
+
+//        p1.addSink(new WriteMarkerSink()).slotSharingGroup("slotG1");
 
         // Part 2
-        DataStream<Tweet> p2 = keyTweets.flatMap(new RightPara()).name("Parameters2");
+        DataStream<RegressionPara> p2 = tweets
+                .keyBy(new RegKeySelector())
+                .timeWindow(Time.milliseconds(timeWindowSize))
+//                .countWindow(countWindowSize)
+                .apply(new RightPara()).name("Parameters2").slotSharingGroup("slotG3");
+//                .keyBy(new RegKeySelector())
+//                .map(new StateRightPara());
 
-        DataStream<Tweet> finalStream = p1.connect(p2)
-                .keyBy("uselessKey", "uselessKey")
-                .flatMap(new CombinePara()).name("Combine")
-                .keyBy("uselessKey")
-                .flatMap(new FinalPara()).name("Final");
+        DataStream<RegressionPara> joinStream = p1.join(p2)
+                .where(new RegKeySelector())
+                .equalTo(new RegKeySelector())
+                .window(TumblingEventTimeWindows.of(Time.milliseconds(timeWindowSize)))
+//                .window(SlidingEventTimeWindows.of(Time.milliseconds(timeWindowSize), Time.milliseconds(slideTimeWindowStep)))
+//                .window(GlobalWindows.create()).trigger(PurgingTrigger.of(CountTrigger.of(countWindowSize)))
+                .apply(new CombinePara());
 
-        finalStream.flatMap(new SampleFlatMap())
-                .addSink(kafkaSink(config)).name("Sink");
+        DataStream<RegressionPara> finalStream = joinStream//.filter(new FinalFilter())
+                .keyBy(new RegKeySelector())
+                .map(new FinalPara()).name("Final");
+
+//        finalStream.flatMap(new RegFinalMap()).addSink(KafkaSink());
+        finalStream.addSink(new WriteMarkerSink()).name("Sink").slotSharingGroup("slotG1");
 
         // execute program
         env.execute("Twitter Streaming");
     }
 }
-

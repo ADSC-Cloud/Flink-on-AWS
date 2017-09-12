@@ -22,16 +22,14 @@ under the License.
 	
 	<groupId>flink-example</groupId>
 	<artifactId>flink-example</artifactId>
-	<version>0.1</version>
+	<version>1.0</version>
 	<packaging>jar</packaging>
 
-	<name>Flink Quickstart Job</name>
-	<url>http://www.myorganization.org</url>
+	<name>Flink Streaming Benchmark</name>
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<!--<flink.version>1.2-SNAPSHOT</flink.version>-->
-		<flink.version>1.1.3</flink.version>
+		<flink.version>1.3.2</flink.version>
 	</properties>
 
 	<repositories>
